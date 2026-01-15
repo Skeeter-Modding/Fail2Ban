@@ -192,6 +192,25 @@ create_systemd_service() {
         return
     fi
 
+    print_info "Creating dedicated user for Discord bot..."
+    
+    # Create fail2ban-discord user if it doesn't exist
+    if ! id -u fail2ban-discord &>/dev/null; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin fail2ban-discord
+        print_success "Created fail2ban-discord user"
+    else
+        print_info "User fail2ban-discord already exists"
+    fi
+    
+    # Configure sudo permissions for fail2ban-client
+    print_info "Configuring sudo permissions..."
+    cat > /etc/sudoers.d/fail2ban-discord << 'EOF'
+# Allow fail2ban-discord user to run fail2ban-client commands
+fail2ban-discord ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client
+EOF
+    chmod 0440 /etc/sudoers.d/fail2ban-discord
+    print_success "Sudo configuration created"
+
     print_info "Creating systemd service..."
 
     cat > "$SYSTEMD_DIR/fail2ban-discord.service" << EOF
@@ -202,8 +221,8 @@ Wants=fail2ban.service
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=fail2ban-discord
+Group=fail2ban-discord
 ExecStart=/usr/bin/python3 $INSTALL_DIR/discord_bot.py
 Restart=always
 RestartSec=10
@@ -214,6 +233,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=$LOG_DIR/fail2ban-discord.log
+ReadOnlyPaths=$CONFIG_DIR
 
 [Install]
 WantedBy=multi-user.target

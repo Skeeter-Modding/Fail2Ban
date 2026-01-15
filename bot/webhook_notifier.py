@@ -126,7 +126,9 @@ def notify_ban(webhook_url: str, jail: str, ip: str, matches: int = 0,
     if config.get('include_geoip', True):
         geo = get_geoip_info(ip, config.get('geoip_db', '/usr/share/GeoIP/GeoLite2-City.mmdb'))
         if geo:
-            location = f":flag_{geo.get('country_code', 'xx').lower()}: {geo.get('country', 'Unknown')}"
+            country_code_raw = geo.get('country_code') or 'xx'
+            country_code = str(country_code_raw).lower()
+            location = f":flag_{country_code}: {geo.get('country', 'Unknown')}"
             if geo.get('city') and geo.get('city') != 'Unknown':
                 location += f", {geo['city']}"
             fields.append({'name': 'Location', 'value': location, 'inline': True})

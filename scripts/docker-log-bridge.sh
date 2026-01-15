@@ -101,7 +101,7 @@ start_monitoring() {
         for container in $current_containers; do
             local log_file="$LOG_DIR/${container}.log"
             # Check if we're already streaming this container
-            if ! pgrep -f "docker logs -f $container" > /dev/null; then
+            if ! pgrep -f "docker logs -f \"$container\"" > /dev/null; then
                 print_info "New container detected: $container"
                 stream_container_logs "$container"
             fi

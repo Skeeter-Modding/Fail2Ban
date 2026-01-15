@@ -5,7 +5,6 @@ A Discord bot for managing Fail2Ban and receiving ban notifications.
 Includes AbuseIPDB integration, statistics tracking, and attack detection.
 """
 
-import asyncio
 import configparser
 import ipaddress
 import logging
@@ -13,8 +12,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime, time
-from pathlib import Path
-from typing import Optional
+from typing import Tuple, List
 
 import discord
 from discord import app_commands
@@ -75,12 +73,18 @@ class Fail2BanManager:
     def __init__(self, client_path: str = "/usr/bin/fail2ban-client"):
         self.client_path = client_path
         self._whitelist_file = "/etc/fail2ban-discord/whitelist.txt"
+        # Check if we need to use sudo (when not running as root)
+        self.use_sudo = os.geteuid() != 0
 
-    def _run_command(self, *args) -> tuple[bool, str]:
+    def _run_command(self, *args) -> Tuple[bool, str]:
         """Run a fail2ban-client command and return success status and output."""
         try:
+            # Prepend sudo if not running as root
+            cmd = ["sudo", self.client_path] if self.use_sudo else [self.client_path]
+            cmd.extend(list(args))
+            
             result = subprocess.run(
-                [self.client_path] + list(args),
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -93,29 +97,29 @@ class Fail2BanManager:
         except Exception as e:
             return False, str(e)
 
-    def get_status(self) -> tuple[bool, str]:
+    def get_status(self) -> Tuple[bool, str]:
         """Get overall Fail2Ban status."""
         return self._run_command("status")
 
-    def get_jail_status(self, jail: str) -> tuple[bool, str]:
+    def get_jail_status(self, jail: str) -> Tuple[bool, str]:
         """Get status of a specific jail."""
         return self._run_command("status", jail)
 
-    def ban_ip(self, jail: str, ip: str) -> tuple[bool, str]:
+    def ban_ip(self, jail: str, ip: str) -> Tuple[bool, str]:
         """Manually ban an IP in a jail."""
         return self._run_command("set", jail, "banip", ip)
 
-    def unban_ip(self, jail: str, ip: str) -> tuple[bool, str]:
+    def unban_ip(self, jail: str, ip: str) -> Tuple[bool, str]:
         """Unban an IP from a jail."""
         return self._run_command("set", jail, "unbanip", ip)
 
-    def unban_all(self, jail: str = None) -> tuple[bool, str]:
+    def unban_all(self, jail: str = None) -> Tuple[bool, str]:
         """Unban all IPs from a jail or all jails."""
         if jail:
             return self._run_command("set", jail, "unbanip", "--all")
         return self._run_command("unban", "--all")
 
-    def get_banned_ips(self, jail: str) -> tuple[bool, list]:
+    def get_banned_ips(self, jail: str) -> Tuple[bool, List]:
         """Get list of banned IPs in a jail."""
         success, output = self._run_command("get", jail, "banip")
         if success:
@@ -123,7 +127,7 @@ class Fail2BanManager:
             return True, ips
         return False, []
 
-    def get_jails(self) -> tuple[bool, list]:
+    def get_jails(self) -> Tuple[bool, List]:
         """Get list of all jails."""
         success, output = self.get_status()
         if success:
@@ -133,7 +137,7 @@ class Fail2BanManager:
                     return True, [j.strip() for j in jails.split(',') if j.strip()]
         return False, []
 
-    def reload(self, jail: str = None) -> tuple[bool, str]:
+    def reload(self, jail: str = None) -> Tuple[bool, str]:
         """Reload Fail2Ban configuration."""
         if jail:
             return self._run_command("reload", jail)
@@ -152,10 +156,11 @@ class Fail2BanManager:
                 with open(self._whitelist_file, 'r') as f:
                     return [line.strip() for line in f if line.strip() and not line.startswith('#')]
         except Exception:
+            # Silently ignore errors reading whitelist file (file may not exist or be inaccessible)
             pass
         return []
 
-    def add_to_whitelist(self, ip: str) -> tuple[bool, str]:
+    def add_to_whitelist(self, ip: str) -> Tuple[bool, str]:
         """Add an IP to the whitelist."""
         try:
             # Validate IP
@@ -166,7 +171,9 @@ class Fail2BanManager:
                 return False, "IP already in whitelist"
 
             # Ensure directory exists
-            Path(self._whitelist_file).parent.mkdir(parents=True, exist_ok=True)
+            whitelist_dir = os.path.dirname(self._whitelist_file)
+            if whitelist_dir:
+                os.makedirs(whitelist_dir, exist_ok=True)
 
             with open(self._whitelist_file, 'a') as f:
                 f.write(f"{ip}\n")
@@ -177,7 +184,7 @@ class Fail2BanManager:
         except Exception as e:
             return False, str(e)
 
-    def remove_from_whitelist(self, ip: str) -> tuple[bool, str]:
+    def remove_from_whitelist(self, ip: str) -> Tuple[bool, str]:
         """Remove an IP from the whitelist."""
         try:
             whitelist = self.get_whitelist()
@@ -209,6 +216,7 @@ class GeoIPLookup:
             try:
                 self.reader = geoip2.database.Reader(db_path)
             except Exception:
+                # Silently ignore GeoIP database initialization errors (database may be corrupted or incompatible)
                 pass
 
     def lookup(self, ip: str) -> dict:
@@ -358,7 +366,9 @@ class Fail2BanBot(commands.Bot):
             geo = self.geoip.lookup(ip)
             if geo:
                 country_code = geo.get('country_code')
-                location = f":flag_{geo.get('country_code', 'xx').lower()}: {geo.get('country', 'Unknown')}"
+                country_code_raw = geo.get('country_code') or 'xx'
+                country_code = str(country_code_raw).lower()
+                location = f":flag_{country_code}: {geo.get('country', 'Unknown')}"
                 if geo.get('city') and geo.get('city') != 'Unknown':
                     location += f", {geo['city']}"
                 fields.append({'name': 'Location', 'value': location, 'inline': True})
