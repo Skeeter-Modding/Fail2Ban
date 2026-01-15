@@ -2,21 +2,23 @@
 """
 Fail2Ban Discord Bot
 A Discord bot for managing Fail2Ban and receiving ban notifications.
+Includes AbuseIPDB integration, statistics tracking, and attack detection.
 """
 
 import asyncio
 import configparser
+import ipaddress
 import logging
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # Optional GeoIP support
 try:
@@ -24,6 +26,14 @@ try:
     GEOIP_AVAILABLE = True
 except ImportError:
     GEOIP_AVAILABLE = False
+
+# Import our modules
+try:
+    from .abuseipdb import AbuseIPDBClient, format_ip_report, get_categories_for_jail, get_risk_level
+    from .statistics import BanStatistics, format_stats_embed, format_attack_alert
+except ImportError:
+    from abuseipdb import AbuseIPDBClient, format_ip_report, get_categories_for_jail, get_risk_level
+    from statistics import BanStatistics, format_stats_embed, format_attack_alert
 
 
 class Config:
@@ -52,12 +62,19 @@ class Config:
     def getint(self, section: str, key: str, fallback=0):
         return self.config.getint(section, key, fallback=fallback)
 
+    def getlist(self, section: str, key: str, fallback=None):
+        value = self.config.get(section, key, fallback='')
+        if not value:
+            return fallback or []
+        return [item.strip() for item in value.split(',') if item.strip()]
+
 
 class Fail2BanManager:
     """Interface for Fail2Ban operations."""
 
     def __init__(self, client_path: str = "/usr/bin/fail2ban-client"):
         self.client_path = client_path
+        self._whitelist_file = "/etc/fail2ban-discord/whitelist.txt"
 
     def _run_command(self, *args) -> tuple[bool, str]:
         """Run a fail2ban-client command and return success status and output."""
@@ -127,6 +144,60 @@ class Fail2BanManager:
         success, output = self._run_command("ping")
         return success and "pong" in output.lower()
 
+    # Whitelist management
+    def get_whitelist(self) -> list:
+        """Get the current whitelist."""
+        try:
+            if os.path.exists(self._whitelist_file):
+                with open(self._whitelist_file, 'r') as f:
+                    return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        except Exception:
+            pass
+        return []
+
+    def add_to_whitelist(self, ip: str) -> tuple[bool, str]:
+        """Add an IP to the whitelist."""
+        try:
+            # Validate IP
+            ipaddress.ip_address(ip)
+
+            whitelist = self.get_whitelist()
+            if ip in whitelist:
+                return False, "IP already in whitelist"
+
+            # Ensure directory exists
+            Path(self._whitelist_file).parent.mkdir(parents=True, exist_ok=True)
+
+            with open(self._whitelist_file, 'a') as f:
+                f.write(f"{ip}\n")
+
+            return True, f"Added {ip} to whitelist"
+        except ValueError:
+            return False, "Invalid IP address"
+        except Exception as e:
+            return False, str(e)
+
+    def remove_from_whitelist(self, ip: str) -> tuple[bool, str]:
+        """Remove an IP from the whitelist."""
+        try:
+            whitelist = self.get_whitelist()
+            if ip not in whitelist:
+                return False, "IP not in whitelist"
+
+            whitelist.remove(ip)
+
+            with open(self._whitelist_file, 'w') as f:
+                for item in whitelist:
+                    f.write(f"{item}\n")
+
+            return True, f"Removed {ip} from whitelist"
+        except Exception as e:
+            return False, str(e)
+
+    def is_whitelisted(self, ip: str) -> bool:
+        """Check if an IP is whitelisted."""
+        return ip in self.get_whitelist()
+
 
 class GeoIPLookup:
     """GeoIP lookup for IP addresses."""
@@ -176,14 +247,32 @@ class Fail2BanBot(commands.Bot):
 
         self.config = config
         self.f2b = Fail2BanManager(config.get('fail2ban', 'fail2ban_client', '/usr/bin/fail2ban-client'))
-        self.geoip = GeoIPLookup() if config.getboolean('notifications', 'include_geoip', False) else None
+        self.geoip = GeoIPLookup() if config.getboolean('notifications', 'include_geoip', True) else None
         self.notification_channel_id = config.getint('discord', 'channel_id')
         self.admin_role_id = config.getint('discord', 'admin_role_id', 0) or None
         self.guild_id = config.getint('discord', 'guild_id')
 
+        # AbuseIPDB client
+        abuseipdb_key = config.get('abuseipdb', 'api_key', '')
+        self.abuseipdb = AbuseIPDBClient(abuseipdb_key) if abuseipdb_key else None
+        self.auto_report = config.getboolean('abuseipdb', 'auto_report', False)
+        self.report_threshold = config.getint('abuseipdb', 'report_threshold', 50)
+
+        # Statistics
+        self.stats = BanStatistics()
+        self.stats.alert_threshold = config.getint('attack_detection', 'alert_threshold', 10)
+        self.stats.alert_window = config.getint('attack_detection', 'alert_window', 60)
+
+        # Scheduled reports
+        self.daily_report_enabled = config.getboolean('reports', 'daily_report', False)
+        self.weekly_report_enabled = config.getboolean('reports', 'weekly_report', False)
+
     async def setup_hook(self):
         """Set up the bot's slash commands."""
         await self.add_cog(Fail2BanCommands(self))
+        await self.add_cog(AbuseIPDBCommands(self))
+        await self.add_cog(StatisticsCommands(self))
+        await self.add_cog(WhitelistCommands(self))
 
         if self.guild_id:
             guild = discord.Object(id=self.guild_id)
@@ -192,13 +281,20 @@ class Fail2BanBot(commands.Bot):
         else:
             await self.tree.sync()
 
+        # Start background tasks
+        self.attack_monitor.start()
+        if self.daily_report_enabled:
+            self.daily_report_task.start()
+        if self.weekly_report_enabled:
+            self.weekly_report_task.start()
+
     async def on_ready(self):
         logging.info(f"Bot connected as {self.user}")
 
         if self.config.getboolean('notifications', 'notify_on_start', True):
             await self.send_notification(
                 title="Fail2Ban Bot Started",
-                description=f"Bot is now online and monitoring.",
+                description="Bot is now online and monitoring.",
                 color=int(self.config.get('notifications', 'info_color', '0099ff'), 16)
             )
 
@@ -238,8 +334,13 @@ class Fail2BanBot(commands.Bot):
             logging.error(f"Failed to send notification: {e}")
 
     async def notify_ban(self, jail: str, ip: str, matches: int = 0, log_lines: list = None):
-        """Send a ban notification."""
+        """Send a ban notification with optional AbuseIPDB info."""
         if not self.config.getboolean('notifications', 'notify_on_ban', True):
+            return
+
+        # Check whitelist
+        if self.f2b.is_whitelisted(ip):
+            logging.info(f"Skipping ban notification for whitelisted IP: {ip}")
             return
 
         fields = [
@@ -250,13 +351,56 @@ class Fail2BanBot(commands.Bot):
         if matches:
             fields.append({'name': 'Matches', 'value': str(matches), 'inline': True})
 
+        country_code = None
+
+        # GeoIP lookup
         if self.geoip:
             geo = self.geoip.lookup(ip)
             if geo:
+                country_code = geo.get('country_code')
                 location = f":flag_{geo.get('country_code', 'xx').lower()}: {geo.get('country', 'Unknown')}"
                 if geo.get('city') and geo.get('city') != 'Unknown':
                     location += f", {geo['city']}"
                 fields.append({'name': 'Location', 'value': location, 'inline': True})
+
+        # AbuseIPDB lookup
+        abuse_score = None
+        if self.abuseipdb:
+            try:
+                abuse_data = self.abuseipdb.check_ip(ip)
+                if abuse_data:
+                    abuse_score = abuse_data.get('abuseConfidenceScore', 0)
+                    risk_level, _ = get_risk_level(abuse_score)
+                    fields.append({
+                        'name': 'Abuse Score',
+                        'value': f"**{abuse_score}%** ({risk_level})",
+                        'inline': True
+                    })
+                    if abuse_data.get('totalReports'):
+                        fields.append({
+                            'name': 'Total Reports',
+                            'value': str(abuse_data['totalReports']),
+                            'inline': True
+                        })
+
+                    if not country_code:
+                        country_code = abuse_data.get('countryCode')
+
+                    # Auto-report if enabled and score is below threshold
+                    if self.auto_report and abuse_score < self.report_threshold:
+                        categories = get_categories_for_jail(jail)
+                        self.abuseipdb.report_ip(ip, categories, f"Banned by Fail2Ban jail: {jail}")
+                        fields.append({
+                            'name': 'Reported',
+                            'value': 'Reported to AbuseIPDB',
+                            'inline': True
+                        })
+
+            except Exception as e:
+                logging.error(f"AbuseIPDB lookup failed: {e}")
+
+        # Record in statistics
+        self.stats.record_ban(ip, jail, country_code, abuse_score, self.auto_report)
 
         if log_lines:
             log_preview = '\n'.join(log_lines[:3])
@@ -267,7 +411,7 @@ class Fail2BanBot(commands.Bot):
         color = int(self.config.get('notifications', 'ban_color', 'ff0000'), 16)
         await self.send_notification(
             title="IP Banned",
-            description=f"An IP address has been banned by Fail2Ban.",
+            description="An IP address has been banned by Fail2Ban.",
             color=color,
             fields=fields
         )
@@ -277,6 +421,9 @@ class Fail2BanBot(commands.Bot):
         if not self.config.getboolean('notifications', 'notify_on_unban', True):
             return
 
+        # Record in statistics
+        self.stats.record_unban(ip, jail)
+
         fields = [
             {'name': 'IP Address', 'value': f'`{ip}`', 'inline': True},
             {'name': 'Jail', 'value': f'`{jail}`', 'inline': True},
@@ -285,9 +432,20 @@ class Fail2BanBot(commands.Bot):
         color = int(self.config.get('notifications', 'unban_color', '00ff00'), 16)
         await self.send_notification(
             title="IP Unbanned",
-            description=f"An IP address has been unbanned.",
+            description="An IP address has been unbanned.",
             color=color,
             fields=fields
+        )
+
+    async def notify_attack(self, attack_info: dict):
+        """Send an attack detection alert."""
+        alert_data = format_attack_alert(attack_info)
+
+        await self.send_notification(
+            title="Potential Attack Detected",
+            description="High ban rate detected - possible brute force or DDoS attack in progress.",
+            color=0xff0000,
+            fields=alert_data['fields']
         )
 
     def is_admin(self, member: discord.Member) -> bool:
@@ -297,6 +455,63 @@ class Fail2BanBot(commands.Bot):
         if self.admin_role_id:
             return any(role.id == self.admin_role_id for role in member.roles)
         return True  # If no admin role set, allow all users
+
+    @tasks.loop(seconds=30)
+    async def attack_monitor(self):
+        """Monitor for potential attacks."""
+        try:
+            attack_info = self.stats.check_attack_condition()
+            if attack_info:
+                await self.notify_attack(attack_info)
+        except Exception as e:
+            logging.error(f"Attack monitor error: {e}")
+
+    @attack_monitor.before_loop
+    async def before_attack_monitor(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(time=time(hour=8, minute=0))  # 8 AM daily
+    async def daily_report_task(self):
+        """Send daily statistics report."""
+        try:
+            stats = self.stats.generate_daily_report()
+            stats_embed = format_stats_embed(stats)
+
+            await self.send_notification(
+                title="Daily Fail2Ban Report",
+                description=f"Statistics for the last 24 hours",
+                color=int(self.config.get('notifications', 'info_color', '0099ff'), 16),
+                fields=stats_embed['fields']
+            )
+        except Exception as e:
+            logging.error(f"Daily report error: {e}")
+
+    @daily_report_task.before_loop
+    async def before_daily_report(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(time=time(hour=8, minute=0))  # 8 AM, runs on Mondays via check
+    async def weekly_report_task(self):
+        """Send weekly statistics report."""
+        if datetime.now().weekday() != 0:  # Only on Monday
+            return
+
+        try:
+            stats = self.stats.generate_weekly_report()
+            stats_embed = format_stats_embed(stats)
+
+            await self.send_notification(
+                title="Weekly Fail2Ban Report",
+                description=f"Statistics for the last 7 days",
+                color=int(self.config.get('notifications', 'info_color', '0099ff'), 16),
+                fields=stats_embed['fields']
+            )
+        except Exception as e:
+            logging.error(f"Weekly report error: {e}")
+
+    @weekly_report_task.before_loop
+    async def before_weekly_report(self):
+        await self.wait_until_ready()
 
 
 class Fail2BanCommands(commands.Cog):
@@ -345,7 +560,7 @@ class Fail2BanCommands(commands.Cog):
         success, jails = self.bot.f2b.get_jails()
 
         if success and jails:
-            jail_list = '\n'.join([f"• `{jail}`" for jail in jails])
+            jail_list = '\n'.join([f"- `{jail}`" for jail in jails])
             embed = discord.Embed(
                 title="Available Jails",
                 description=jail_list,
@@ -370,7 +585,7 @@ class Fail2BanCommands(commands.Cog):
 
         if success:
             if ips:
-                ip_list = '\n'.join([f"• `{ip}`" for ip in ips[:50]])
+                ip_list = '\n'.join([f"- `{ip}`" for ip in ips[:50]])
                 if len(ips) > 50:
                     ip_list += f"\n... and {len(ips) - 50} more"
                 description = ip_list
@@ -404,6 +619,16 @@ class Fail2BanCommands(commands.Cog):
             return
 
         await interaction.response.defer()
+
+        # Check whitelist
+        if self.bot.f2b.is_whitelisted(ip):
+            embed = discord.Embed(
+                title="Cannot Ban",
+                description=f"IP `{ip}` is whitelisted and cannot be banned.",
+                color=discord.Color.orange()
+            )
+            await interaction.followup.send(embed=embed)
+            return
 
         success, output = self.bot.f2b.ban_ip(jail, ip)
 
@@ -549,30 +774,361 @@ class Fail2BanCommands(commands.Cog):
         )
 
         commands_list = [
-            ("/status [jail]", "Get Fail2Ban status or specific jail status"),
+            ("**Core Commands**", ""),
+            ("/status [jail]", "Get Fail2Ban status"),
             ("/jails", "List all available jails"),
             ("/banned <jail>", "List banned IPs in a jail"),
-            ("/ban <jail> <ip>", "Manually ban an IP address"),
-            ("/unban <jail> <ip>", "Unban an IP address"),
-            ("/unbanall [jail]", "Unban all IPs from a jail or all jails"),
-            ("/reload [jail]", "Reload Fail2Ban configuration"),
+            ("/ban <jail> <ip>", "Manually ban an IP"),
+            ("/unban <jail> <ip>", "Unban an IP"),
+            ("/unbanall [jail]", "Unban all IPs"),
+            ("/reload [jail]", "Reload configuration"),
             ("/ping", "Check if Fail2Ban is running"),
+            ("", ""),
+            ("**IP Intelligence**", ""),
+            ("/checkip <ip>", "Check IP reputation on AbuseIPDB"),
+            ("/reportip <ip> <jail>", "Report IP to AbuseIPDB"),
+            ("", ""),
+            ("**Statistics**", ""),
+            ("/stats [hours]", "View ban statistics"),
+            ("/history <ip>", "View ban history for an IP"),
+            ("/offenders", "List repeat offenders"),
+            ("", ""),
+            ("**Whitelist**", ""),
+            ("/whitelist", "View whitelisted IPs"),
+            ("/whitelist-add <ip>", "Add IP to whitelist"),
+            ("/whitelist-remove <ip>", "Remove IP from whitelist"),
         ]
 
         for cmd, desc in commands_list:
-            embed.add_field(name=cmd, value=desc, inline=False)
+            if cmd:
+                embed.add_field(name=cmd, value=desc or "\u200b", inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+
+class AbuseIPDBCommands(commands.Cog):
+    """Commands for AbuseIPDB integration."""
+
+    def __init__(self, bot: Fail2BanBot):
+        self.bot = bot
+
+    @app_commands.command(name="checkip", description="Check IP reputation on AbuseIPDB")
+    @app_commands.describe(ip="IP address to check")
+    async def checkip(self, interaction: discord.Interaction, ip: str):
+        """Check IP reputation on AbuseIPDB."""
+        if not self.bot.abuseipdb:
+            await interaction.response.send_message(
+                "AbuseIPDB is not configured. Add your API key to the config.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        try:
+            data = self.bot.abuseipdb.check_ip(ip)
+
+            if data:
+                report = format_ip_report(data)
+                embed = discord.Embed(
+                    title=f"IP Reputation: {ip}",
+                    color=report.get('color', discord.Color.blue())
+                )
+
+                for field in report['fields']:
+                    embed.add_field(
+                        name=field['name'],
+                        value=field['value'],
+                        inline=field.get('inline', True)
+                    )
+
+                embed.set_footer(text="Data from AbuseIPDB")
+            else:
+                embed = discord.Embed(
+                    title=f"IP Reputation: {ip}",
+                    description="No data found for this IP address.",
+                    color=discord.Color.grey()
+                )
+
+        except Exception as e:
+            embed = discord.Embed(
+                title="Error",
+                description=f"Failed to check IP: {str(e)}",
+                color=discord.Color.red()
+            )
+
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="reportip", description="Report IP to AbuseIPDB")
+    @app_commands.describe(ip="IP address to report", jail="Jail/category for the report")
+    async def reportip(self, interaction: discord.Interaction, ip: str, jail: str):
+        """Report an IP to AbuseIPDB."""
+        if not self.bot.is_admin(interaction.user):
+            await interaction.response.send_message(
+                "You don't have permission to report IPs.",
+                ephemeral=True
+            )
+            return
+
+        if not self.bot.abuseipdb:
+            await interaction.response.send_message(
+                "AbuseIPDB is not configured.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        try:
+            categories = get_categories_for_jail(jail)
+            success = self.bot.abuseipdb.report_ip(
+                ip, categories, f"Reported via Discord - Jail: {jail}"
+            )
+
+            if success:
+                embed = discord.Embed(
+                    title="IP Reported",
+                    description=f"Successfully reported `{ip}` to AbuseIPDB.",
+                    color=discord.Color.green()
+                )
+                logging.info(f"Reported {ip} to AbuseIPDB by {interaction.user}")
+            else:
+                embed = discord.Embed(
+                    title="Report Failed",
+                    description="Failed to report IP to AbuseIPDB.",
+                    color=discord.Color.red()
+                )
+
+        except Exception as e:
+            embed = discord.Embed(
+                title="Error",
+                description=f"Failed to report IP: {str(e)}",
+                color=discord.Color.red()
+            )
+
+        await interaction.followup.send(embed=embed)
+
+
+class StatisticsCommands(commands.Cog):
+    """Commands for viewing ban statistics."""
+
+    def __init__(self, bot: Fail2BanBot):
+        self.bot = bot
+
+    @app_commands.command(name="stats", description="View ban statistics")
+    @app_commands.describe(hours="Time period in hours (default: 24)")
+    async def stats(self, interaction: discord.Interaction, hours: int = 24):
+        """View ban statistics."""
+        await interaction.response.defer()
+
+        try:
+            stats = self.bot.stats.get_stats(hours)
+            stats_embed = format_stats_embed(stats)
+
+            embed = discord.Embed(
+                title=f"Ban Statistics (Last {hours} hours)",
+                color=discord.Color.blue()
+            )
+
+            for field in stats_embed['fields']:
+                embed.add_field(
+                    name=field['name'],
+                    value=field['value'],
+                    inline=field.get('inline', True)
+                )
+
+        except Exception as e:
+            embed = discord.Embed(
+                title="Error",
+                description=f"Failed to get statistics: {str(e)}",
+                color=discord.Color.red()
+            )
+
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="history", description="View ban history for an IP")
+    @app_commands.describe(ip="IP address to check")
+    async def history(self, interaction: discord.Interaction, ip: str):
+        """View ban history for an IP."""
+        await interaction.response.defer()
+
+        try:
+            history = self.bot.stats.get_ip_history(ip)
+
+            if history:
+                history_list = []
+                for entry in history[:15]:
+                    action = "Banned" if entry['action'] == 'ban' else "Unbanned"
+                    line = f"`{entry['timestamp'][:16]}` - {action} in `{entry['jail']}`"
+                    if entry.get('abuse_score'):
+                        line += f" (Score: {entry['abuse_score']}%)"
+                    history_list.append(line)
+
+                embed = discord.Embed(
+                    title=f"Ban History: {ip}",
+                    description="\n".join(history_list),
+                    color=discord.Color.blue()
+                )
+                embed.set_footer(text=f"Total events: {len(history)}")
+            else:
+                embed = discord.Embed(
+                    title=f"Ban History: {ip}",
+                    description="No history found for this IP.",
+                    color=discord.Color.grey()
+                )
+
+        except Exception as e:
+            embed = discord.Embed(
+                title="Error",
+                description=f"Failed to get history: {str(e)}",
+                color=discord.Color.red()
+            )
+
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="offenders", description="List repeat offenders")
+    @app_commands.describe(min_bans="Minimum number of bans (default: 3)")
+    async def offenders(self, interaction: discord.Interaction, min_bans: int = 3):
+        """List repeat offenders."""
+        await interaction.response.defer()
+
+        try:
+            offenders = self.bot.stats.get_repeat_offenders(min_bans)
+
+            if offenders:
+                offender_list = []
+                for o in offenders[:15]:
+                    line = f"`{o['ip']}` - **{o['ban_count']}** bans"
+                    if o.get('max_abuse_score'):
+                        line += f" (Max score: {o['max_abuse_score']}%)"
+                    if o.get('jails'):
+                        line += f"\n  Jails: {', '.join(o['jails'][:3])}"
+                    offender_list.append(line)
+
+                embed = discord.Embed(
+                    title="Repeat Offenders (Last 7 days)",
+                    description="\n".join(offender_list),
+                    color=discord.Color.orange()
+                )
+            else:
+                embed = discord.Embed(
+                    title="Repeat Offenders",
+                    description=f"No IPs with {min_bans}+ bans found.",
+                    color=discord.Color.grey()
+                )
+
+        except Exception as e:
+            embed = discord.Embed(
+                title="Error",
+                description=f"Failed to get offenders: {str(e)}",
+                color=discord.Color.red()
+            )
+
+        await interaction.followup.send(embed=embed)
+
+
+class WhitelistCommands(commands.Cog):
+    """Commands for managing IP whitelist."""
+
+    def __init__(self, bot: Fail2BanBot):
+        self.bot = bot
+
+    @app_commands.command(name="whitelist", description="View whitelisted IPs")
+    async def whitelist(self, interaction: discord.Interaction):
+        """View the current whitelist."""
+        whitelist = self.bot.f2b.get_whitelist()
+
+        if whitelist:
+            ip_list = '\n'.join([f"- `{ip}`" for ip in whitelist[:50]])
+            if len(whitelist) > 50:
+                ip_list += f"\n... and {len(whitelist) - 50} more"
+
+            embed = discord.Embed(
+                title="Whitelisted IPs",
+                description=ip_list,
+                color=discord.Color.green()
+            )
+            embed.set_footer(text=f"Total: {len(whitelist)} IPs")
+        else:
+            embed = discord.Embed(
+                title="Whitelisted IPs",
+                description="No IPs in whitelist.",
+                color=discord.Color.grey()
+            )
+
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="whitelist-add", description="Add IP to whitelist")
+    @app_commands.describe(ip="IP address to whitelist")
+    async def whitelist_add(self, interaction: discord.Interaction, ip: str):
+        """Add an IP to the whitelist."""
+        if not self.bot.is_admin(interaction.user):
+            await interaction.response.send_message(
+                "You don't have permission to modify the whitelist.",
+                ephemeral=True
+            )
+            return
+
+        success, message = self.bot.f2b.add_to_whitelist(ip)
+
+        if success:
+            embed = discord.Embed(
+                title="IP Whitelisted",
+                description=f"Successfully added `{ip}` to whitelist.",
+                color=discord.Color.green()
+            )
+            logging.info(f"Whitelist add: {ip} by {interaction.user}")
+        else:
+            embed = discord.Embed(
+                title="Failed",
+                description=message,
+                color=discord.Color.red()
+            )
+
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="whitelist-remove", description="Remove IP from whitelist")
+    @app_commands.describe(ip="IP address to remove")
+    async def whitelist_remove(self, interaction: discord.Interaction, ip: str):
+        """Remove an IP from the whitelist."""
+        if not self.bot.is_admin(interaction.user):
+            await interaction.response.send_message(
+                "You don't have permission to modify the whitelist.",
+                ephemeral=True
+            )
+            return
+
+        success, message = self.bot.f2b.remove_from_whitelist(ip)
+
+        if success:
+            embed = discord.Embed(
+                title="IP Removed",
+                description=f"Successfully removed `{ip}` from whitelist.",
+                color=discord.Color.green()
+            )
+            logging.info(f"Whitelist remove: {ip} by {interaction.user}")
+        else:
+            embed = discord.Embed(
+                title="Failed",
+                description=message,
+                color=discord.Color.red()
+            )
 
         await interaction.response.send_message(embed=embed)
 
 
 def main():
     """Main entry point for the bot."""
+    # Ensure log directory exists
+    log_file = '/var/log/fail2ban-discord.log'
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler('/var/log/fail2ban-discord.log')
+            logging.FileHandler(log_file)
         ]
     )
 

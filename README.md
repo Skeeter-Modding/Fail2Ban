@@ -1,11 +1,15 @@
 # Fail2Ban Discord Integration
 
-A comprehensive integration between Fail2Ban and Discord for server security monitoring and management. Features real-time ban notifications, Discord slash commands for remote management, and custom filters for Arma Reforger game servers.
+A comprehensive integration between Fail2Ban and Discord for server security monitoring and management. Features real-time ban notifications, Discord slash commands for remote management, IP reputation checking, statistics tracking, and custom filters for Arma Reforger game servers.
 
 ## Features
 
 - **Real-time Notifications**: Get instant Discord alerts when IPs are banned/unbanned
 - **Discord Bot Commands**: Manage Fail2Ban remotely via Discord slash commands
+- **AbuseIPDB Integration**: Check IP reputation and auto-report malicious IPs
+- **Ban Statistics & Reports**: Track ban history, view trends, daily/weekly reports
+- **Attack Detection**: Get alerts when ban rate spikes (potential DDoS/brute force)
+- **IP Whitelist Management**: Manage whitelisted IPs via Discord
 - **GeoIP Support**: See geographic location of banned IPs
 - **Arma Reforger Support**: Custom filters for Arma Reforger dedicated servers
 - **Docker Support**: Bridge logs from Docker containers to Fail2Ban
@@ -106,6 +110,8 @@ For simple notifications without command support:
 
 ## Bot Commands
 
+### Core Commands
+
 | Command | Description |
 |---------|-------------|
 | `/status [jail]` | Get Fail2Ban status or specific jail status |
@@ -117,6 +123,92 @@ For simple notifications without command support:
 | `/reload [jail]` | Reload Fail2Ban configuration |
 | `/ping` | Check if Fail2Ban is running |
 | `/help` | Show help for all commands |
+
+### IP Intelligence (AbuseIPDB)
+
+| Command | Description |
+|---------|-------------|
+| `/checkip <ip>` | Check IP reputation on AbuseIPDB |
+| `/reportip <ip> <jail>` | Report an IP to AbuseIPDB |
+
+### Statistics
+
+| Command | Description |
+|---------|-------------|
+| `/stats [hours]` | View ban statistics for time period |
+| `/history <ip>` | View ban history for a specific IP |
+| `/offenders [min_bans]` | List repeat offenders |
+
+### Whitelist Management
+
+| Command | Description |
+|---------|-------------|
+| `/whitelist` | View whitelisted IPs |
+| `/whitelist-add <ip>` | Add IP to whitelist |
+| `/whitelist-remove <ip>` | Remove IP from whitelist |
+
+## AbuseIPDB Integration
+
+The bot integrates with [AbuseIPDB](https://www.abuseipdb.com/) to provide IP reputation data and contribute to the community database.
+
+### Setup
+
+1. Get a free API key from [AbuseIPDB](https://www.abuseipdb.com/account/api)
+
+2. Add to your config:
+   ```ini
+   [abuseipdb]
+   api_key = YOUR_API_KEY_HERE
+   auto_report = true
+   report_threshold = 50
+   ```
+
+### Features
+
+- **IP Reputation Check**: Ban notifications show abuse confidence score
+- **Auto-Report**: Automatically report banned IPs to AbuseIPDB
+- **Manual Report**: Use `/reportip` to report IPs manually
+- **Risk Levels**: Visual indicators (Critical, High, Medium, Low, Clean)
+
+## Attack Detection
+
+The bot monitors ban rates and alerts you when potential attacks are detected.
+
+### Configuration
+
+```ini
+[attack_detection]
+enabled = true
+alert_threshold = 10    # Bans within window to trigger alert
+alert_window = 60       # Time window in seconds
+alert_cooldown = 300    # Seconds between alerts
+```
+
+When ban rate exceeds the threshold, you'll receive a Discord alert with:
+- Number of bans detected
+- Bans per minute rate
+- Unique IPs involved
+- Affected jails
+
+## Statistics & Reports
+
+### On-Demand Statistics
+
+Use `/stats 24` to see statistics for the last 24 hours:
+- Total bans/unbans
+- Bans by jail
+- Top offenders
+- Geographic distribution
+- High-risk ban count
+
+### Scheduled Reports
+
+Enable automatic reports in config:
+```ini
+[reports]
+daily_report = true    # Daily report at 8 AM
+weekly_report = true   # Weekly report on Mondays
+```
 
 ## Arma Reforger Setup
 
@@ -163,18 +255,24 @@ For Arma Reforger servers running in Docker containers:
    logpath = /var/log/arma-reforger/*.log
    ```
 
-### Custom Filter Patterns
+## Additional Filters
 
-The included filter covers common patterns. To add custom patterns:
+The project includes filters for common services:
 
-```bash
-sudo nano /etc/fail2ban/filter.d/arma-reforger.conf
-```
+| Filter | Description |
+|--------|-------------|
+| `arma-reforger.conf` | Arma Reforger server protection |
+| `nginx-auth.conf` | Nginx HTTP authentication failures |
+| `nginx-badbots.conf` | Bad bots and vulnerability scanners |
+| `gameserver-generic.conf` | Generic game server filter |
 
-Add your patterns to the `failregex` section:
+Enable additional jails in `/etc/fail2ban/jail.d/common-services.local`:
 ```ini
-failregex = ^<HOST> - Your custom pattern here
-            ^Another pattern with <HOST>
+[nginx-badbots]
+enabled = true
+
+[sshd]
+enabled = true
 ```
 
 ## Configuration Reference
@@ -183,80 +281,48 @@ failregex = ^<HOST> - Your custom pattern here
 
 ```ini
 [discord]
-# Discord Bot Token (required for bot functionality)
 bot_token = YOUR_BOT_TOKEN_HERE
-
-# Discord Webhook URL (for notifications only)
 webhook_url = YOUR_WEBHOOK_URL_HERE
-
-# Channel ID for notifications and commands
 channel_id = YOUR_CHANNEL_ID_HERE
-
-# Role ID that can execute admin commands (optional)
 admin_role_id =
-
-# Guild/Server ID (required for slash commands)
 guild_id = YOUR_GUILD_ID_HERE
 
 [fail2ban]
-# Path to fail2ban-client
 fail2ban_client = /usr/bin/fail2ban-client
-
-# Jails to monitor (comma-separated, empty for all)
 monitored_jails = sshd,arma-reforger
-
-# Log file for the bot
 log_file = /var/log/fail2ban-discord.log
 
 [notifications]
-# Notification toggles
 notify_on_ban = true
 notify_on_unban = true
 notify_on_start = true
 notify_on_stop = true
-
-# GeoIP lookup (requires geoip2 package)
 include_geoip = true
-
-# Embed colors (hex without #)
 ban_color = ff0000
 unban_color = 00ff00
 info_color = 0099ff
 
+[abuseipdb]
+api_key =
+auto_report = false
+report_threshold = 50
+
+[attack_detection]
+enabled = true
+alert_threshold = 10
+alert_window = 60
+alert_cooldown = 300
+
+[reports]
+daily_report = false
+weekly_report = false
+
 [arma_reforger]
-# Log path for Arma Reforger servers
 log_path = /var/log/arma-reforger/
-
-# Docker container name pattern
 container_pattern = arma-reforger-*
-
-# Ban thresholds
 max_retry = 5
 find_time = 600
 ban_time = 3600
-```
-
-## Adding Discord Notifications to Existing Jails
-
-To add Discord notifications to any Fail2Ban jail:
-
-### Using the Python Notifier (Recommended)
-
-Edit your jail configuration:
-```ini
-[sshd]
-enabled = true
-action = %(action_)s
-         discord[name=%(name)s]
-```
-
-### Using curl (No Dependencies)
-
-```ini
-[sshd]
-enabled = true
-action = %(action_)s
-         discord-curl[name=%(name)s, webhook_url=YOUR_WEBHOOK_URL]
 ```
 
 ## Troubleshooting
@@ -301,16 +367,16 @@ action = %(action_)s
    sudo tail -f /var/log/fail2ban.log
    ```
 
-### Docker logs not being captured
+### AbuseIPDB not working
 
-1. Check if the bridge is running:
+1. Verify your API key is correct
+2. Check if you've exceeded rate limits (free tier: 1000 checks/day)
+3. Test manually:
    ```bash
-   sudo systemctl status docker-log-bridge
-   ```
-
-2. Verify container pattern matches:
-   ```bash
-   docker ps --format '{{.Names}}' | grep arma-reforger
+   curl -G https://api.abuseipdb.com/api/v2/check \
+     --data-urlencode "ipAddress=1.2.3.4" \
+     -H "Key: YOUR_API_KEY" \
+     -H "Accept: application/json"
    ```
 
 ## Service Management
@@ -347,7 +413,9 @@ Fail2Ban/
 ├── bot/
 │   ├── __init__.py
 │   ├── discord_bot.py      # Full Discord bot with commands
-│   └── webhook_notifier.py # Standalone webhook notifier
+│   ├── webhook_notifier.py # Standalone webhook notifier
+│   ├── abuseipdb.py        # AbuseIPDB integration
+│   └── statistics.py       # Ban statistics tracking
 ├── config/
 │   └── config.example.ini  # Example configuration
 ├── fail2ban/
@@ -355,9 +423,13 @@ Fail2Ban/
 │   │   ├── discord.conf      # Python-based action
 │   │   └── discord-curl.conf # curl-based action
 │   ├── filters/
-│   │   └── arma-reforger.conf # Arma Reforger filter
+│   │   ├── arma-reforger.conf    # Arma Reforger filter
+│   │   ├── nginx-auth.conf       # Nginx auth filter
+│   │   ├── nginx-badbots.conf    # Bad bots filter
+│   │   └── gameserver-generic.conf # Generic game server
 │   └── jails/
-│       └── arma-reforger.local # Arma Reforger jail config
+│       ├── arma-reforger.local   # Arma Reforger jail
+│       └── common-services.local # Common services jails
 ├── scripts/
 │   ├── install.sh           # Installation script
 │   ├── docker-log-bridge.sh # Docker log bridge
@@ -378,4 +450,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - [Fail2Ban](https://www.fail2ban.org/) - The intrusion prevention framework
 - [discord.py](https://discordpy.readthedocs.io/) - Discord API wrapper for Python
+- [AbuseIPDB](https://www.abuseipdb.com/) - IP reputation database
 - [Arma Reforger](https://reforger.armaplatform.com/) - The game this was built for
