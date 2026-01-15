@@ -1,0 +1,11 @@
+# Fail2Ban Discord Integration - Python Dependencies
+
+# Discord bot (required for full bot functionality)
+discord.py>=2.0.0
+
+# Optional: GeoIP support for IP location lookup
+# Requires GeoLite2 database from MaxMind
+geoip2>=4.0.0
+
+# Optional: For async HTTP requests (alternative to built-in urllib)
+# aiohttp>=3.8.0

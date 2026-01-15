@@ -1,0 +1,23 @@
+[Unit]
+Description=Docker Log Bridge for Fail2Ban
+Documentation=https://github.com/Skeeter-Modding/Fail2Ban
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/fail2ban-discord/docker-log-bridge.sh start
+ExecStop=/opt/fail2ban-discord/docker-log-bridge.sh stop
+Restart=always
+RestartSec=10
+
+# Environment configuration
+Environment=LOG_DIR=/var/log/arma-reforger
+Environment=CONTAINER_PATTERN=arma-reforger
+Environment=POLL_INTERVAL=5
+
+# Security
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
