@@ -57,7 +57,7 @@ stream_container_logs() {
     touch "$log_file"
 
     # Stream logs in background
-    docker logs -f "$container" 2>&1 >> "$log_file" &
+    docker logs -f "$container" >> "$log_file" 2>&1 &
     echo $! >> "$PID_FILE.pids"
 }
 
