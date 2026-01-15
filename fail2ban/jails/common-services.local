@@ -1,0 +1,79 @@
+# Fail2Ban Jail Configuration for Common Services
+# Place this file in /etc/fail2ban/jail.d/common-services.local
+#
+# Enable the jails you need by setting enabled = true
+
+# ============================================
+# SSH - Protect against brute force attacks
+# ============================================
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+findtime = 600
+bantime = 3600
+action = iptables-multiport[name=sshd, port="ssh", protocol=tcp]
+         discord[name=sshd]
+
+# ============================================
+# Nginx - HTTP Authentication
+# ============================================
+[nginx-http-auth]
+enabled = false
+port = http,https
+filter = nginx-auth
+logpath = /var/log/nginx/error.log
+          /var/log/nginx/*error.log
+maxretry = 5
+findtime = 600
+bantime = 3600
+action = iptables-multiport[name=nginx-auth, port="http,https", protocol=tcp]
+         discord[name=nginx-auth]
+
+# ============================================
+# Nginx - Bad Bots and Scanners
+# ============================================
+[nginx-badbots]
+enabled = false
+port = http,https
+filter = nginx-badbots
+logpath = /var/log/nginx/access.log
+          /var/log/nginx/*access.log
+maxretry = 2
+findtime = 600
+bantime = 86400
+action = iptables-multiport[name=nginx-badbots, port="http,https", protocol=tcp]
+         discord[name=nginx-badbots]
+
+# ============================================
+# Apache - HTTP Authentication
+# ============================================
+[apache-auth]
+enabled = false
+port = http,https
+filter = apache-auth
+logpath = /var/log/apache2/error.log
+          /var/log/httpd/error_log
+maxretry = 5
+findtime = 600
+bantime = 3600
+action = iptables-multiport[name=apache-auth, port="http,https", protocol=tcp]
+         discord[name=apache-auth]
+
+# ============================================
+# Recidive - Catch repeat offenders across jails
+# ============================================
+[recidive]
+enabled = true
+filter = recidive
+logpath = /var/log/fail2ban.log
+maxretry = 3
+findtime = 86400
+bantime = 604800
+action = iptables-allports[name=recidive]
+         discord[name=recidive]
+
+# Note: recidive bans IPs that get banned multiple times
+# This provides escalating punishment for persistent attackers

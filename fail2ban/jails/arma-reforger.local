@@ -1,0 +1,64 @@
+# Fail2Ban Jail Configuration for Arma Reforger
+# Place this file in /etc/fail2ban/jail.d/arma-reforger.local
+#
+# This jail monitors Arma Reforger server logs and bans malicious IPs.
+
+[arma-reforger]
+enabled = true
+port = 2001,17777,19999
+protocol = udp
+filter = arma-reforger
+
+# Log path - adjust based on your setup
+# For Docker containers, this should point to the mounted log volume
+logpath = /var/log/arma-reforger/console.log
+          /var/log/arma-reforger/server.log
+
+# For Docker logs (using docker logs command)
+# Uncomment and adjust if your logs are in Docker
+# logpath = /var/lib/docker/containers/*arma-reforger*/*-json.log
+
+# Ban settings
+# maxretry: Number of failures before ban
+maxretry = 5
+
+# findtime: Time window to count failures (in seconds)
+# 10 minutes = 600 seconds
+findtime = 600
+
+# bantime: Duration of ban (in seconds)
+# 1 hour = 3600, 1 day = 86400
+bantime = 3600
+
+# Action to take when banning
+# This uses iptables for banning and Discord for notification
+action = iptables-allports[name=arma-reforger, protocol=udp]
+         discord[name=arma-reforger]
+
+# Backend to use for log monitoring
+# auto: automatically detect the best backend
+# Options: auto, pyinotify, gamin, polling, systemd
+backend = auto
+
+# Use aggressive mode to catch more patterns
+mode = aggressive
+
+
+# Additional jail for RCON brute force protection
+[arma-reforger-rcon]
+enabled = true
+port = 19999
+protocol = tcp
+filter = arma-reforger
+
+logpath = /var/log/arma-reforger/console.log
+
+# Stricter settings for RCON attacks
+maxretry = 3
+findtime = 300
+bantime = 86400
+
+action = iptables-allports[name=arma-reforger-rcon, protocol=all]
+         discord[name=arma-reforger-rcon]
+
+backend = auto
