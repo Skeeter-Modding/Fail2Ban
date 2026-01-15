@@ -78,6 +78,17 @@ def send_webhook(webhook_url: str, embed: dict) -> bool:
         print("Error: No webhook URL configured", file=sys.stderr)
         return False
 
+    # Validate webhook URL scheme (only allow https, or http for testing)
+    if not webhook_url.startswith(('https://', 'http://')):
+        print(f"Error: Invalid webhook URL scheme. Must be https:// (or http:// for testing)",
+              file=sys.stderr)
+        return False
+
+    # Warn if using http (insecure)
+    if webhook_url.startswith('http://') and 'localhost' not in webhook_url and '127.0.0.1' not in webhook_url:
+        print("Warning: Using insecure http:// webhook URL. Consider using https://",
+              file=sys.stderr)
+
     payload = {
         "embeds": [embed]
     }
@@ -95,7 +106,8 @@ def send_webhook(webhook_url: str, embed: dict) -> bool:
 
     try:
         with urlopen(request, timeout=10) as response:
-            return response.status == 204
+            # Discord webhooks return 204 No Content on success, but 200 OK is also valid
+            return response.status in (200, 204)
     except HTTPError as e:
         print(f"HTTP Error: {e.code} - {e.reason}", file=sys.stderr)
         return False

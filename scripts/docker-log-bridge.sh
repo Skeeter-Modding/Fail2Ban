@@ -56,7 +56,7 @@ stream_container_logs() {
     # Create log file if it doesn't exist
     touch "$log_file"
 
-    # Stream logs in background
+    # Stream logs in background (redirect stdout to file, then stderr to stdout)
     docker logs -f "$container" >> "$log_file" 2>&1 &
     echo $! >> "$PID_FILE.pids"
 }

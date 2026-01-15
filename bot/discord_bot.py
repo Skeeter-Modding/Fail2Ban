@@ -252,6 +252,13 @@ class Fail2BanBot(commands.Bot):
         self.admin_role_id = config.getint('discord', 'admin_role_id', 0) or None
         self.guild_id = config.getint('discord', 'guild_id')
 
+        # Warn if admin_role_id is not configured
+        if not self.admin_role_id:
+            logging.warning(
+                "admin_role_id is not configured. Only server administrators will be able to "
+                "execute admin commands. Set admin_role_id in config to allow a specific role."
+            )
+
         # AbuseIPDB client
         abuseipdb_key = config.get('abuseipdb', 'api_key', '')
         self.abuseipdb = AbuseIPDBClient(abuseipdb_key) if abuseipdb_key else None
@@ -454,7 +461,7 @@ class Fail2BanBot(commands.Bot):
             return True
         if self.admin_role_id:
             return any(role.id == self.admin_role_id for role in member.roles)
-        return True  # If no admin role set, allow all users
+        return False  # If no admin role set and not server admin, deny access
 
     @tasks.loop(seconds=30)
     async def attack_monitor(self):
@@ -1119,17 +1126,31 @@ class WhitelistCommands(commands.Cog):
 
 def main():
     """Main entry point for the bot."""
-    # Ensure log directory exists
-    log_file = '/var/log/fail2ban-discord.log'
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    # Configure log file path (can be overridden by environment variable)
+    log_file = os.environ.get('FAIL2BAN_DISCORD_LOG', '/var/log/fail2ban-discord.log')
+
+    # Set up logging handlers
+    handlers = [logging.StreamHandler()]
+
+    # Try to set up file handler
+    try:
+        log_dir = Path(log_file).parent
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check if directory is writable
+        if os.access(log_dir, os.W_OK):
+            handlers.append(logging.FileHandler(log_file))
+        else:
+            print(f"Warning: Log directory {log_dir} is not writable, logging to console only",
+                  file=sys.stderr)
+    except (OSError, PermissionError) as e:
+        print(f"Warning: Could not set up file logging ({e}), logging to console only",
+              file=sys.stderr)
 
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_file)
-        ]
+        handlers=handlers
     )
 
     config_path = os.environ.get('FAIL2BAN_DISCORD_CONFIG', '/etc/fail2ban-discord/config.ini')

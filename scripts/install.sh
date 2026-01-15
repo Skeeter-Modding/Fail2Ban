@@ -108,7 +108,7 @@ install_python_packages() {
     pip3 install --upgrade pip
 
     if [[ "$INSTALL_BOT" == true ]]; then
-        pip3 install discord.py>=2.0.0
+        pip3 install "discord.py>=2.0.0"
     fi
 
     # Optional: GeoIP support
